@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { adminEmailLogin } from '../../api/authApi.js'
 import { useAuth } from '../../hooks/useAuth.js'
@@ -10,11 +10,17 @@ import { USER_ROLES } from '../../constants/userRoles.js'
  */
 export function AdminLoginPage() {
   const navigate = useNavigate()
-  const { applySession } = useAuth()
+  const { user, isAuthenticated, applySession } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+
+  useEffect(() => {
+    if (isAuthenticated && user?.role === USER_ROLES.ADMIN) {
+      navigate('/admin', { replace: true })
+    }
+  }, [isAuthenticated, user, navigate])
 
   async function handleSubmit(e) {
     e.preventDefault()
