@@ -1,0 +1,667 @@
+import { Booking } from '../models/Booking.js'
+import { LabourSubcategory } from '../models/LabourSubcategory.js'
+import { LabourService } from '../models/LabourService.js'
+import { SystemSetting } from '../models/SystemSetting.js'
+import { Wallet } from '../models/Wallet.js'
+import { AdminWallet } from '../models/AdminWallet.js'
+import { asyncHandler } from '../utils/asyncHandler.js'
+import { HTTP_STATUS, sendError, sendSuccess } from '../utils/apiResponse.js'
+import { parseISTDateTime } from '../utils/dateHelper.js'
+import { sendToUser } from '../services/notificationService.js'
+import { qualifyReferralForBooking } from '../services/referralService.js'
+import { creditSelfBalance, debitSelfBalance, getSelfBalance } from '../services/walletService.js'
+import { refundBookingWalletDiscount, topUpWorkerForCashDiscount } from '../services/bookingSettlementService.js'
+
+export const calculateBill = asyncHandler(async (req, res) => {
+  const { serviceId, durationDays = 1 } = req.body
+  const service = await LabourService.findById(serviceId)
+  let basePrice = 0
+  
+  if (service) {
+    basePrice = service.basePrice * durationDays
+  } else {
+    const { LabourCategory } = await import('../models/LabourCategory.js')
+    const category = await LabourCategory.findById(serviceId)
+    if (category) {
+      basePrice = 800 * durationDays
+    } else {
+      return sendError(res, { message: 'Service or Category not found', statusCode: HTTP_STATUS.NOT_FOUND })
+    }
+  }
+
+  let settings = await SystemSetting.findOne({ configKey: 'master_config' })
+  if (!settings) {
+    settings = await SystemSetting.create({ configKey: 'master_config' })
+  }
+
+
+  let platformFee = 0
+
+  if (settings.platformFee.isActive) {
+    if (settings.platformFee.type === 'fixed') {
+      platformFee = settings.platformFee.value
+    } else if (settings.platformFee.type === 'percentage') {
+      platformFee = (basePrice * settings.platformFee.value) / 100
+    }
+  }
+
+  const baseAmount = basePrice + platformFee
+  let taxes = 0
+
+  if (settings.gstPercentage > 0) {
+    taxes = (baseAmount * settings.gstPercentage) / 100
+  }
+
+  const totalAmount = baseAmount + taxes
+
+  // Also pre-calculate commission to show to admin internally, but user doesn't necessarily need to see it
+  let commissionAmount = 0
+  if (settings.commission.isActive && settings.commission.type === 'global') {
+    commissionAmount = (basePrice * settings.commission.globalPercentage) / 100
+  }
+
+  // Wallet credit the customer could spend on this booking.
+  const walletBalance = await getSelfBalance(req.user._id)
+  const maxWalletDiscount = Math.min(walletBalance, totalAmount)
+
+  return sendSuccess(res, {
+    data: {
+      basePrice,
+      platformFee,
+      taxes,
+      totalAmount,
+      commissionAmount, // Internal calculation preview
+      laborShare: basePrice - commissionAmount,
+      walletBalance,
+      maxWalletDiscount,
+      payableAfterWallet: totalAmount - maxWalletDiscount,
+    }
+  })
+})
+
+export const createBooking = asyncHandler(async (req, res) => {
+  const { serviceId, type, scheduledAt, timeSlot, endTime, locationText, lat, lng, paymentMethod, notes, durationKind = 'full_day', durationDays = 1, imageNames = [], useWallet = false } = req.body
+
+  if (!serviceId || !type || !locationText || !paymentMethod) {
+    return sendError(res, { message: 'Missing required fields', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  if (lat === undefined || lng === undefined) {
+    return sendError(res, { message: 'Latitude and Longitude are required for accurate matching', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  if (type === 'SCHEDULED') {
+    if (!scheduledAt || !timeSlot) {
+      return sendError(res, { message: 'scheduledAt date and timeSlot (startTime) are required for SCHEDULED bookings', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+    if (durationKind !== 'multi_day' && !endTime) {
+      return sendError(res, { message: 'endTime is required for single day SCHEDULED bookings', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+  }
+
+  const service = await LabourService.findById(serviceId)
+  if (!service || !service.isActive) {
+    return sendError(res, { message: 'Valid and active Service required', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  let settings = await SystemSetting.findOne({ configKey: 'master_config' })
+  
+  let activeSub = null
+  if (settings?.isUserSubscriptionEnabled) {
+    const { UserSubscription } = await import('../models/UserSubscription.js')
+    activeSub = await UserSubscription.findOne({ user: req.user._id, status: 'active' }).populate('plan')
+    
+    if (!activeSub) {
+      return sendError(res, { message: 'You must have an active subscription to create a booking.', statusCode: HTTP_STATUS.FORBIDDEN })
+    }
+    if (activeSub.bookingsUsed >= (activeSub.snapshotPlanDetails?.allowedBookings || 0)) {
+      return sendError(res, { message: 'You have reached the maximum number of bookings allowed for your current subscription plan.', statusCode: HTTP_STATUS.FORBIDDEN })
+    }
+  }
+
+  const basePrice = service.basePrice * (durationKind === 'multi_day' ? durationDays : 1)
+  let platformFee = 0
+  if (settings?.platformFee?.isActive) {
+    platformFee = settings.platformFee.type === 'fixed' 
+      ? settings.platformFee.value 
+      : (basePrice * settings.platformFee.value) / 100
+  }
+  
+  const baseAmount = basePrice + platformFee
+  let taxes = 0
+  if (settings?.gstPercentage > 0) {
+    taxes = (baseAmount * settings.gstPercentage) / 100
+  }
+  
+  const totalAmount = baseAmount + taxes
+
+  let commissionAmount = 0
+  if (settings?.commission?.isActive && settings.commission.type === 'global') {
+    commissionAmount = (basePrice * settings.commission.globalPercentage) / 100
+  }
+
+  const laborShare = basePrice - commissionAmount
+
+  /**
+   * Wallet discount. The debit happens before the booking is written so the
+   * balance check and the deduction are one atomic step; if anything below
+   * fails we put the money back.
+   */
+  let walletDiscount = 0
+  if (useWallet) {
+    const balance = await getSelfBalance(req.user._id)
+    const requested = Math.min(balance, totalAmount)
+    if (requested > 0) {
+      const debit = await debitSelfBalance({
+        userId: req.user._id,
+        amount: requested,
+        context: 'BOOKING',
+        description: `Wallet applied to ${service.name || 'booking'}`,
+      })
+      if (!debit) {
+        return sendError(res, {
+          message: 'Your wallet balance changed. Please review the bill and try again.',
+          statusCode: HTTP_STATUS.CONFLICT,
+          code: 'WALLET_BALANCE_CHANGED',
+        })
+      }
+      walletDiscount = requested
+    }
+  }
+  const payableAmount = totalAmount - walletDiscount
+
+  const startOtp = Math.floor(1000 + Math.random() * 9000).toString()
+  const completionOtp = Math.floor(1000 + Math.random() * 9000).toString()
+
+  let attendanceLog = []
+  const parsedScheduledAt = type === 'SCHEDULED' ? parseISTDateTime(scheduledAt, timeSlot) : undefined;
+  if (durationKind === 'multi_day' && parsedScheduledAt) {
+    for (let i = 0; i < durationDays; i++) {
+      const date = new Date(parsedScheduledAt.getTime() + i * 24 * 60 * 60 * 1000)
+      const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+      attendanceLog.push({
+        dateStr,
+        dayNumber: i + 1,
+        startOtp: Math.floor(1000 + Math.random() * 9000).toString(),
+        endOtp: Math.floor(1000 + Math.random() * 9000).toString(),
+      })
+    }
+  }
+
+  let booking
+  try {
+    booking = await Booking.create({
+    userId: req.user._id,
+    subcategoryId: service.subcategoryId,
+    serviceId: service._id,
+    type,
+    scheduledAt: parsedScheduledAt,
+    timeSlot: type === 'SCHEDULED' ? timeSlot : (type === 'INSTANT' ? timeSlot : undefined),
+    endTime: type === 'SCHEDULED' ? endTime : undefined,
+    images: Array.isArray(imageNames) ? imageNames : [],
+    notes,
+    durationKind,
+    durationDays,
+    address: { 
+      locationText,
+      coordinates: {
+        type: 'Point',
+        coordinates: [parseFloat(lng), parseFloat(lat)] // GeoJSON uses [longitude, latitude]
+      }
+    },
+    basePrice,
+    platformFee,
+    taxes,
+    totalAmount,
+    commissionAmount,
+    laborShare,
+    walletDiscount,
+    payableAmount,
+    paymentMethod,
+    status: 'CREATED',
+    startOtp,
+    completionOtp,
+    attendanceLog
+    })
+  } catch (err) {
+    // Give the wallet credit back rather than swallowing it with the booking.
+    if (walletDiscount > 0) {
+      await creditSelfBalance({
+        userId: req.user._id,
+        amount: walletDiscount,
+        context: 'BOOKING',
+        description: 'Wallet refund — booking could not be created',
+      }).catch((e) => console.error('[wallet] refund after failed booking:', e?.message || e))
+    }
+    throw err
+  }
+
+  if (activeSub) {
+    const { UserSubscription } = await import('../models/UserSubscription.js')
+    await UserSubscription.findByIdAndUpdate(activeSub._id, { $inc: { bookingsUsed: 1 } })
+  }
+
+  // Phase 3: Trigger the Broadcast Engine asynchronously
+  // Only trigger immediately for INSTANT bookings.
+  // SCHEDULED bookings will be handled by the broadcastCron job 30 mins before the time.
+  if (type === 'INSTANT') {
+    import('../services/broadcastService.js').then(({ startBroadcastCycle }) => {
+      startBroadcastCycle(booking._id).catch(err => console.error('Broadcast Error:', err))
+    })
+  } else {
+    // For scheduled, we can emit a socket event to let the user know it is confirmed and queued
+    import('../socket.js').then(({ emitToUser }) => {
+      emitToUser(booking.userId, 'BOOKING_SCHEDULED_QUEUED', { bookingId: booking._id, scheduledAt: booking.scheduledAt })
+    }).catch(err => console.error(err))
+
+    sendToUser(booking.userId, {
+      title: 'Booking scheduled',
+      body: 'Your booking is confirmed. We will start finding a worker 30 minutes before the scheduled time.',
+      type: 'BOOKING_SCHEDULED_QUEUED',
+      data: { bookingId: String(booking._id), link: '/app/my-bookings' },
+    }).catch(err => console.error('Push notify (scheduled) failed:', err))
+  }
+
+  // Save the address for future use if requested
+  if (req.body.saveAddress) {
+    import('../models/User.js').then(({ User }) => {
+      User.findByIdAndUpdate(req.user._id, {
+        'savedAddress.text': locationText,
+        'savedAddress.lat': lat,
+        'savedAddress.lng': lng
+      }).catch(err => console.error('Update savedAddress error:', err))
+    })
+    import('../models/UserAddress.js').then(({ UserAddress }) => {
+      UserAddress.updateOne(
+        { userId: req.user._id, address: String(locationText).trim() },
+        { $setOnInsert: { label: 'Other', lat: lat ?? null, lng: lng ?? null } },
+        { upsert: true },
+      ).catch(err => console.error('Save UserAddress error:', err))
+    })
+  }
+
+  return sendSuccess(res, { message: 'Booking created successfully', statusCode: HTTP_STATUS.CREATED, data: { booking } })
+})
+
+export const getBookingStatus = asyncHandler(async (req, res) => {
+  const booking = await Booking.findById(req.params.id)
+    .populate('subcategoryId')
+    .populate('serviceId')
+    .populate('laborId', 'fullName phone profileImageUrl')
+    .populate('userId', 'fullName phone')
+    .lean()
+
+  if (!booking) {
+    return sendError(res, { message: 'Booking not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  }
+
+  // Hide OTPs from labourer
+  if (['labour', 'contractor'].includes(req.user.role)) {
+    delete booking.startOtp
+    delete booking.completionOtp
+  }
+
+  return sendSuccess(res, { data: { booking } })
+})
+
+export const getMyBookings = asyncHandler(async (req, res) => {
+  const { role, _id } = req.user
+  
+  let query = {}
+  if (role === 'individual' || role === 'corporate') {
+    query = { userId: _id }
+  } else if (role === 'labour' || role === 'contractor') {
+    query = { laborId: _id, status: { $in: ['ACCEPTED', 'ASSIGNED', 'EN_ROUTE', 'STARTED', 'COMPLETED', 'CANCELLED'] } }
+  } else {
+    return sendError(res, { message: 'Unauthorized role for fetching bookings', statusCode: HTTP_STATUS.FORBIDDEN })
+  }
+
+  const bookings = await Booking.find(query)
+    .populate('subcategoryId')
+    .populate('serviceId')
+    .populate('userId', 'fullName phone')
+    .populate('laborId', 'fullName phone profileImageUrl')
+    .sort({ createdAt: -1 })
+    .lean()
+
+  if (['labour', 'contractor'].includes(role)) {
+    bookings.forEach(b => {
+      delete b.startOtp
+      delete b.completionOtp
+    })
+  }
+
+  return sendSuccess(res, { data: { bookings } })
+})
+
+// @desc    Update booking payment method
+// @route   PATCH /api/v1/bookings/:id/payment-method
+// @access  Private (User)
+export const updatePaymentMethod = asyncHandler(async (req, res) => {
+  const { paymentMethod } = req.body
+  const booking = await Booking.findById(req.params.id)
+
+  if (!booking) {
+    return sendError(res, { message: 'Booking not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  }
+
+  // Only allow updating if it belongs to the user
+  if (booking.userId.toString() !== req.user.id) {
+    return sendError(res, { message: 'Not authorized', statusCode: HTTP_STATUS.FORBIDDEN })
+  }
+
+  booking.paymentMethod = paymentMethod
+  await booking.save()
+
+  res.json({ success: true, paymentMethod })
+})
+
+export const updateBookingStatus = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { status, otp, startWorkImage, endWorkImage, beforeImage, afterImage } = req.body
+  const booking = await Booking.findById(id)
+  
+  if (!booking) return sendError(res, { message: 'Booking not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  
+  if (String(booking.laborId) !== String(req.user._id) && String(booking.userId) !== String(req.user._id)) {
+    return sendError(res, { message: 'Unauthorized', statusCode: HTTP_STATUS.FORBIDDEN })
+  }
+
+  const validTransitions = {
+    'ACCEPTED': ['EN_ROUTE', 'CANCELLED'],
+    'EN_ROUTE': ['STARTED', 'CANCELLED'],
+    'STARTED': ['COMPLETED']
+  }
+
+  if (!validTransitions[booking.status]?.includes(status)) {
+    return sendError(res, { message: `Invalid transition from ${booking.status} to ${status}`, statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  // OTP Verification
+  if (status === 'STARTED') {
+    if (booking.durationKind === 'multi_day') {
+      return sendError(res, { message: 'Please use the daily verification flow for multi-day bookings.', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+    if (!otp) return sendError(res, { message: 'OTP is required to start the job', statusCode: HTTP_STATUS.BAD_REQUEST })
+    if (String(otp).trim() !== String(booking.startOtp).trim()) return sendError(res, { message: 'Invalid Start OTP', statusCode: HTTP_STATUS.BAD_REQUEST })
+    const finalStartImg = startWorkImage || beforeImage
+    if (finalStartImg) booking.startWorkImage = finalStartImg
+  }
+
+  if (status === 'COMPLETED') {
+    if (booking.durationKind === 'multi_day') {
+      return sendError(res, { message: 'Please use the daily verification flow for multi-day bookings.', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+    if (!otp) return sendError(res, { message: 'OTP is required to complete the job', statusCode: HTTP_STATUS.BAD_REQUEST })
+    if (String(otp).trim() !== String(booking.completionOtp).trim()) return sendError(res, { message: 'Invalid Completion OTP', statusCode: HTTP_STATUS.BAD_REQUEST })
+    const finalEndImg = endWorkImage || afterImage
+    if (finalEndImg) booking.endWorkImage = finalEndImg
+  }
+
+  booking.status = status
+  await booking.save()
+
+  // Refer & Earn: a completed booking is what makes the customer's referral pay out.
+  if (status === 'COMPLETED') {
+    await qualifyReferralForBooking(booking)
+    await topUpWorkerForCashDiscount(booking)
+  }
+
+  if (status === 'CANCELLED') {
+    await refundBookingWalletDiscount(booking, 'cancelled')
+  }
+
+  // Phase 4: Handle Commission if Cash Payment and Completed
+  if (status === 'COMPLETED') {
+    let wallet = await Wallet.findOne({ userId: booking.laborId })
+    if (!wallet) wallet = new Wallet({ userId: booking.laborId })
+
+    if (booking.paymentMethod === 'CASH') {
+      // Increment labor's admin wallet liability
+      const adminDues = (booking.platformFee || 0) + (booking.taxes || 0) + (booking.commissionAmount || 0)
+      wallet.adminBalance += adminDues
+      await wallet.save()
+
+      import('../models/WalletTransaction.js').then(({ WalletTransaction }) => {
+        WalletTransaction.create({
+          walletId: wallet._id,
+          amount: adminDues,
+          type: 'CREDIT',
+          targetWallet: 'ADMIN',
+          context: 'BOOKING',
+          referenceId: booking._id,
+          description: 'Platform fees, taxes & commission for Cash Booking'
+        }).catch(err => console.error('WalletTx error:', err))
+      })
+
+      // Log splits to AdminWallet for Platform Fee and Commission
+      if (booking.platformFee > 0 || booking.commissionAmount > 0 || booking.basePrice > 0 || booking.taxes > 0) {
+        import('../models/AdminWallet.js').then(async ({ AdminWallet }) => {
+          let adminWallet = await AdminWallet.findOne()
+          if (!adminWallet) adminWallet = new AdminWallet()
+          
+          adminWallet.totalPlatformFeesCollected += (booking.platformFee || 0)
+          adminWallet.totalCommissionsCollected += (booking.commissionAmount || 0)
+          adminWallet.totalTaxesCollected += (booking.taxes || 0)
+          adminWallet.totalServiceAmountCollected += (booking.basePrice || 0)
+          await adminWallet.save()
+        }).catch(err => console.error('AdminWallet error:', err))
+      }
+    } else if (booking.paymentMethod === 'ONLINE') {
+      // ONLY payout if the customer has actually completed the online payment.
+      // If they haven't paid yet, the paymentController will handle this payout later once they pay.
+      if (booking.paymentStatus === 'PAID') {
+        // Add laborShare to labor's self wallet
+        wallet.selfBalance += booking.laborShare
+        await wallet.save()
+
+        import('../models/WalletTransaction.js').then(({ WalletTransaction }) => {
+          WalletTransaction.create({
+            walletId: wallet._id,
+            amount: booking.laborShare,
+            type: 'CREDIT',
+            targetWallet: 'SELF',
+            context: 'PAYOUT',
+            referenceId: booking._id,
+            description: 'Payout for Online Booking'
+          }).catch(err => console.error('WalletTx error:', err))
+        })
+
+        // Log splits to AdminWallet for Platform Fee, Commission and total business
+        if (booking.platformFee > 0 || booking.commissionAmount > 0 || booking.basePrice > 0 || booking.taxes > 0) {
+          let adminWallet = await AdminWallet.findOne()
+          if (!adminWallet) adminWallet = new AdminWallet()
+          
+          adminWallet.totalPlatformFeesCollected += (booking.platformFee || 0)
+          adminWallet.totalCommissionsCollected += (booking.commissionAmount || 0)
+          adminWallet.totalTaxesCollected += (booking.taxes || 0)
+          adminWallet.totalServiceAmountCollected += (booking.basePrice || 0)
+          await adminWallet.save()
+        }
+      }
+    }
+  }
+
+  // Notify customer
+  import('../socket.js').then(({ emitToUser }) => {
+    emitToUser(booking.userId, 'BOOKING_STATUS_UPDATE', { bookingId: booking._id, status })
+  }).catch(err => console.error(err))
+
+  // Push notifications — tell the party who did NOT perform the action
+  const actorIsCustomer = String(booking.userId) === String(req.user._id)
+  const statusMessages = {
+    EN_ROUTE: { title: 'Worker on the way', body: 'Your worker is on the way to your location.' },
+    STARTED: { title: 'Work started', body: 'Your worker has started the job.' },
+    COMPLETED: { title: 'Job completed', body: 'Your job has been completed. Please rate your experience.' },
+    CANCELLED: { title: 'Booking cancelled', body: actorIsCustomer ? 'The customer cancelled the booking.' : 'The worker cancelled your booking.' },
+  }
+  const msg = statusMessages[status]
+  if (msg) {
+    // Customer gets updates for everything the worker does
+    if (!actorIsCustomer || status === 'CANCELLED') {
+      const recipient = actorIsCustomer ? booking.laborId : booking.userId
+      const link = actorIsCustomer ? '/app/jobs' : `/app/tracking/${booking._id}`
+      sendToUser(recipient, {
+        title: msg.title,
+        body: msg.body,
+        type: `BOOKING_${status}`,
+        data: { bookingId: String(booking._id), status, link },
+      }).catch(err => console.error('Push notify (status) failed:', err))
+    }
+  }
+
+  return sendSuccess(res, { message: `Booking marked as ${status}`, data: { booking } })
+})
+
+export const verifyDailyOtp = asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { type, otp, dayNumber, image } = req.body
+  const booking = await Booking.findById(id)
+  
+  if (!booking) return sendError(res, { message: 'Booking not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  
+  if (String(booking.laborId) !== String(req.user._id) && String(booking.userId) !== String(req.user._id)) {
+    return sendError(res, { message: 'Unauthorized', statusCode: HTTP_STATUS.FORBIDDEN })
+  }
+
+  if (booking.durationKind !== 'multi_day') {
+    return sendError(res, { message: 'Daily OTP verification is only for multi-day bookings', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  const dayIndex = booking.attendanceLog.findIndex(log => log.dayNumber === dayNumber)
+  if (dayIndex === -1) {
+    return sendError(res, { message: 'Invalid day number', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  const log = booking.attendanceLog[dayIndex]
+
+  // Customer-facing push for this verification; only the labourer calls this
+  // endpoint, so the notification always goes to the customer (booking.userId).
+  let notifyPayload = null
+
+  if (type === 'start') {
+    if (log.startOtp !== otp) {
+      return sendError(res, { message: 'Invalid Start OTP for this day', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+    log.startOtpVerifiedAt = new Date()
+    // Mark as started if it's the first day
+    if (dayNumber === 1 && booking.status !== 'STARTED') {
+      booking.status = 'STARTED'
+      booking.startWorkImage = image || booking.startWorkImage
+      notifyPayload = {
+        title: 'Work started',
+        body: 'Your worker has started the job.',
+        type: 'BOOKING_STARTED',
+      }
+    } else {
+      notifyPayload = {
+        title: `Day ${dayNumber} started`,
+        body: `Your worker has started day ${dayNumber} of the job.`,
+        type: 'BOOKING_DAY_STARTED',
+      }
+    }
+  } else if (type === 'end') {
+    if (log.endOtp !== otp) {
+      return sendError(res, { message: 'Invalid End OTP for this day', statusCode: HTTP_STATUS.BAD_REQUEST })
+    }
+    log.endOtpVerifiedAt = new Date()
+    notifyPayload = {
+      title: `Day ${dayNumber} completed`,
+      body: `Your worker has completed day ${dayNumber}. Work continues tomorrow.`,
+      type: 'BOOKING_DAY_COMPLETED',
+    }
+
+    // If this is the last day, complete the booking
+    if (dayNumber === booking.durationDays) {
+      booking.status = 'COMPLETED'
+      booking.endWorkImage = image || booking.endWorkImage
+      notifyPayload = {
+        title: 'Job completed',
+        body: 'Your job has been completed. Please rate your experience.',
+        type: 'BOOKING_COMPLETED',
+      }
+
+      // Refer & Earn: same hooks as the single-day completion path above.
+      await qualifyReferralForBooking(booking)
+      await topUpWorkerForCashDiscount(booking)
+
+      // Perform wallet transactions exactly as the standard completion flow
+      import('../models/Wallet.js').then(async ({ Wallet }) => {
+        let wallet = await Wallet.findOne({ userId: booking.laborId })
+        if (!wallet) wallet = new Wallet({ userId: booking.laborId })
+
+        if (booking.paymentMethod === 'CASH') {
+          const adminDues = (booking.platformFee || 0) + (booking.taxes || 0) + (booking.commissionAmount || 0)
+          wallet.adminBalance += adminDues
+          await wallet.save()
+
+          import('../models/WalletTransaction.js').then(({ WalletTransaction }) => {
+            WalletTransaction.create({
+              walletId: wallet._id,
+              amount: adminDues,
+              type: 'CREDIT',
+              targetWallet: 'ADMIN',
+              context: 'BOOKING',
+              referenceId: booking._id,
+              description: 'Platform fees, taxes & commission for Cash Booking'
+            }).catch(err => console.error('WalletTx error:', err))
+          })
+
+          if (booking.platformFee > 0 || booking.commissionAmount > 0 || booking.basePrice > 0 || booking.taxes > 0) {
+            import('../models/AdminWallet.js').then(async ({ AdminWallet }) => {
+              let adminWallet = await AdminWallet.findOne()
+              if (!adminWallet) adminWallet = new AdminWallet()
+              adminWallet.totalPlatformFeesCollected += (booking.platformFee || 0)
+              adminWallet.totalCommissionsCollected += (booking.commissionAmount || 0)
+              adminWallet.totalTaxesCollected += (booking.taxes || 0)
+              adminWallet.totalServiceAmountCollected += (booking.basePrice || 0)
+              await adminWallet.save()
+            }).catch(err => console.error('AdminWallet error:', err))
+          }
+        } else if (booking.paymentMethod === 'ONLINE') {
+          if (booking.paymentStatus === 'PAID') {
+            wallet.selfBalance += booking.laborShare
+            await wallet.save()
+
+            import('../models/WalletTransaction.js').then(({ WalletTransaction }) => {
+              WalletTransaction.create({
+                walletId: wallet._id,
+                amount: booking.laborShare,
+                type: 'CREDIT',
+                targetWallet: 'SELF',
+                context: 'BOOKING',
+                referenceId: booking._id,
+                description: 'Service payout for completed Online Booking'
+              }).catch(err => console.error('WalletTx error:', err))
+            })
+
+            import('../models/AdminWallet.js').then(async ({ AdminWallet }) => {
+              let adminWallet = await AdminWallet.findOne()
+              if (!adminWallet) adminWallet = new AdminWallet()
+              adminWallet.totalPlatformFeesCollected += (booking.platformFee || 0)
+              adminWallet.totalCommissionsCollected += (booking.commissionAmount || 0)
+              adminWallet.totalTaxesCollected += (booking.taxes || 0)
+              adminWallet.totalServiceAmountCollected += (booking.basePrice || 0)
+              await adminWallet.save()
+            }).catch(err => console.error('AdminWallet error:', err))
+          }
+        }
+      }).catch(err => console.error('Wallet completion error:', err))
+    }
+  }
+
+  await booking.save()
+
+  import('../socket.js').then(({ emitToUser }) => {
+    emitToUser(booking.userId, 'BOOKING_STATUS_UPDATE', { bookingId: booking._id, status: booking.status })
+  }).catch(err => console.error(err))
+
+  if (notifyPayload) {
+    sendToUser(booking.userId, {
+      ...notifyPayload,
+      data: { bookingId: String(booking._id), status: booking.status, dayNumber, link: `/app/tracking/${booking._id}` },
+    }).catch(err => console.error('Push notify (daily otp) failed:', err))
+  }
+
+  return sendSuccess(res, { message: `Day ${dayNumber} ${type} OTP verified successfully`, data: { booking } })
+})

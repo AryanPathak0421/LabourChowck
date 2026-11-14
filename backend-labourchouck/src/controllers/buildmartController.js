@@ -1,0 +1,366 @@
+import { BuildMartLead } from '../models/BuildMartLead.js'
+import { BuildMartProduct } from '../models/BuildMartProduct.js'
+import { BuildMartCategory } from '../models/BuildMartCategory.js'
+import { BuildMartBanner } from '../models/BuildMartBanner.js'
+import { USER_ROLES } from '../constants/roles.js'
+import { asyncHandler } from '../utils/asyncHandler.js'
+import { HTTP_STATUS, sendError, sendSuccess } from '../utils/apiResponse.js'
+
+/** POST /buildmart/quotes — authenticated users submit material quote requests */
+export const submitQuoteRequest = asyncHandler(async (req, res) => {
+  const {
+    productId,
+    productName,
+    variantId,
+    variantLabel,
+    name,
+    phone,
+    siteLocation,
+    quantity,
+    deliveryDate,
+    notes,
+  } = req.body
+
+  let vendorId = undefined
+  if (productId) {
+    const isObjectId = productId.match(/^[0-9a-fA-F]{24}$/)
+    const query = isObjectId ? { _id: productId } : { id: productId }
+    const product = await BuildMartProduct.findOne(query).select('vendorId').lean()
+    if (product && product.vendorId) {
+      vendorId = product.vendorId
+    }
+  }
+
+  const lead = await BuildMartLead.create({
+    productId,
+    productName,
+    variantId: variantId || undefined,
+    variantLabel: variantLabel || undefined,
+    name,
+    phone,
+    siteLocation,
+    quantity,
+    deliveryDate: deliveryDate || undefined,
+    notes: notes || undefined,
+    userId: req.user._id,
+    vendorId,
+    userRole: req.user.role,
+    userName: req.user.fullName || name,
+  })
+
+  // Route the lead notification to the product's vendor (or admins for platform leads)
+  import('../services/notificationService.js').then(({ sendToUser, notifyAdmins }) => {
+    const payload = {
+      title: 'New product enquiry',
+      body: `${name || 'A customer'} enquired about ${productName || 'a product'}${quantity ? ` (${quantity})` : ''}.`,
+      type: 'BUILDMART_ENQUIRY',
+      data: { leadId: String(lead._id), link: vendorId ? '/vendor/mart/enquiries' : '/admin/mart/enquiries' },
+    }
+    const notifyPromise = vendorId ? sendToUser(vendorId, payload) : notifyAdmins(payload)
+    notifyPromise.catch(err => console.error('Push notify (buildmart enquiry) failed:', err))
+  })
+
+  return sendSuccess(res, {
+    statusCode: HTTP_STATUS.CREATED,
+    message: 'Quote request submitted',
+    data: { lead: lead.toObject() },
+  })
+})
+
+/** GET /admin/buildmart/leads — admin list quote leads */
+export const listLeadsAdmin = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(50, Math.max(5, parseInt(req.query.limit, 10) || 20))
+  const status = req.query.status?.trim()
+  const search = req.query.search?.trim()
+  const type = req.query.type?.trim()
+
+  const filter = {}
+  if (type === 'platform') filter.vendorId = { $eq: null }
+  if (status && status !== 'all') filter.status = status
+  if (search) {
+    const re = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+    filter.$or = [
+      { name: re },
+      { phone: re },
+      { productName: re },
+      { siteLocation: re },
+    ]
+  }
+
+  const [items, total] = await Promise.all([
+    BuildMartLead.find(filter)
+      .sort({ createdAt: -1 })
+      .populate('vendorId', 'fullName phone email')
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    BuildMartLead.countDocuments(filter),
+  ])
+
+  return sendSuccess(res, {
+    data: {
+      items,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    },
+  })
+})
+
+/** PATCH /admin/buildmart/leads/:id — update lead status */
+export const updateLeadStatusAdmin = asyncHandler(async (req, res) => {
+  const { status } = req.body
+  const allowed = ['new', 'contacted', 'quoted', 'won', 'lost']
+  if (!allowed.includes(status)) {
+    return sendError(res, {
+      message: 'Invalid status',
+      statusCode: HTTP_STATUS.BAD_REQUEST,
+      code: 'INVALID_STATUS',
+    })
+  }
+
+  const lead = await BuildMartLead.findByIdAndUpdate(
+    req.params.id,
+    { status },
+    { new: true, runValidators: true },
+  )
+  if (!lead) {
+    return sendError(res, {
+      message: 'Lead not found',
+      statusCode: HTTP_STATUS.NOT_FOUND,
+      code: 'NOT_FOUND',
+    })
+  }
+
+  return sendSuccess(res, {
+    message: 'Lead updated',
+    data: { lead: lead.toObject() },
+  })
+})
+
+export const buildWhatsAppLeadUrl = (lead) => {
+  const adminPhone = process.env.BUILDMART_ADMIN_WHATSAPP || ''
+  if (!adminPhone) return null
+  const text = [
+    'BuildMart quote lead',
+    `Product: ${lead.productName}`,
+    lead.variantLabel ? `Variant: ${lead.variantLabel}` : null,
+    `Name: ${lead.name}`,
+    `Phone: ${lead.phone}`,
+    `Site: ${lead.siteLocation}`,
+    `Qty: ${lead.quantity}`,
+    lead.deliveryDate ? `Delivery: ${lead.deliveryDate}` : null,
+    lead.notes ? `Notes: ${lead.notes}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const digits = adminPhone.replace(/\D/g, '')
+  return `https://wa.me/${digits}?text=${encodeURIComponent(text)}`
+}
+
+/** GET /buildmart/products — list all seeded products (only APPROVED) */
+export const getBuildMartProducts = asyncHandler(async (req, res) => {
+  const products = await BuildMartProduct.find({ status: { $ne: 'PENDING', $ne: 'REJECTED' } }).lean()
+  return sendSuccess(res, {
+    data: { products },
+  })
+})
+
+// --- Categories ---
+
+export const getCategories = asyncHandler(async (req, res) => {
+  const categories = await BuildMartCategory.find().select('-_id -__v -createdAt -updatedAt').lean()
+  return sendSuccess(res, { data: categories })
+})
+
+export const getAdminCategories = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(500, Math.max(5, parseInt(req.query.limit, 10) || 50))
+  const [items, total] = await Promise.all([
+    BuildMartCategory.find()
+      .select('-_id -__v -createdAt -updatedAt')
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    BuildMartCategory.countDocuments(),
+  ])
+  return sendSuccess(res, {
+    data: { items, total, page, pages: Math.max(1, Math.ceil(total / limit)) },
+  })
+})
+
+export const createCategory = asyncHandler(async (req, res) => {
+  const category = await BuildMartCategory.create(req.body)
+  const result = category.toObject()
+  delete result._id
+  delete result.__v
+  delete result.createdAt
+  delete result.updatedAt
+  return sendSuccess(res, { data: result, statusCode: HTTP_STATUS.CREATED })
+})
+
+export const updateCategory = asyncHandler(async (req, res) => {
+  const category = await BuildMartCategory.findOneAndUpdate({ id: req.params.id }, req.body, { new: true }).select('-_id -__v -createdAt -updatedAt').lean()
+  if (!category) return sendError(res, { message: 'Category not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { data: category })
+})
+
+export const deleteCategory = asyncHandler(async (req, res) => {
+  const category = await BuildMartCategory.findOneAndDelete({ id: req.params.id })
+  if (!category) return sendError(res, { message: 'Category not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { message: 'Category deleted successfully' })
+})
+
+// --- Products ---
+
+export const getProducts = asyncHandler(async (req, res) => {
+  const products = await BuildMartProduct.find({ status: { $ne: 'PENDING', $ne: 'REJECTED' } }).select('-_id -__v -createdAt -updatedAt').lean()
+  return sendSuccess(res, { data: products })
+})
+
+export const getAdminProducts = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(500, Math.max(5, parseInt(req.query.limit, 10) || 50))
+  
+  const filter = {}
+  if (req.query.status) filter.status = req.query.status
+
+  const [items, total] = await Promise.all([
+    BuildMartProduct.find(filter)
+      .select('-__v -updatedAt')
+      .populate('vendorId', 'fullName phone email')
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    BuildMartProduct.countDocuments(filter),
+  ])
+  return sendSuccess(res, {
+    data: { items, total, page, pages: Math.max(1, Math.ceil(total / limit)) },
+  })
+})
+
+export const getAdminProductById = asyncHandler(async (req, res) => {
+  const isObjectId = req.params.id.match(/^[0-9a-fA-F]{24}$/)
+  const query = isObjectId ? { _id: req.params.id } : { id: req.params.id }
+  
+  const product = await BuildMartProduct.findOne(query)
+    .select('-__v -updatedAt')
+    .populate('vendorId', 'fullName phone email')
+    .lean()
+    
+  if (!product) return sendError(res, { message: 'Product not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { data: product })
+})
+
+export const createProduct = asyncHandler(async (req, res) => {
+  const payload = { ...req.body }
+  if (!payload.id && payload.name) {
+    payload.id = payload.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+  }
+  const product = await BuildMartProduct.create(payload)
+  const result = product.toObject()
+  delete result._id
+  delete result.__v
+  delete result.createdAt
+  delete result.updatedAt
+  return sendSuccess(res, { data: result, statusCode: HTTP_STATUS.CREATED })
+})
+
+export const updateProduct = asyncHandler(async (req, res) => {
+  const payload = { ...req.body }
+  if (!payload.id && payload.name) {
+    payload.id = payload.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+  }
+  const product = await BuildMartProduct.findOneAndUpdate({ id: req.params.id }, payload, { new: true }).select('-_id -__v -createdAt -updatedAt').lean()
+  if (!product) return sendError(res, { message: 'Product not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { data: product })
+})
+
+export const deleteProduct = asyncHandler(async (req, res) => {
+  const product = await BuildMartProduct.findOneAndDelete({ id: req.params.id })
+  if (!product) return sendError(res, { message: 'Product not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { message: 'Product deleted successfully' })
+})
+
+export const reviewProductAdmin = asyncHandler(async (req, res) => {
+  const { status, rejectionReason } = req.body
+
+  if (!['APPROVED', 'REJECTED'].includes(status)) {
+    return sendError(res, { message: 'Invalid status', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  if (status === 'REJECTED' && !rejectionReason) {
+    return sendError(res, { message: 'Rejection reason is required', statusCode: HTTP_STATUS.BAD_REQUEST })
+  }
+
+  const isObjectId = req.params.id.match(/^[0-9a-fA-F]{24}$/)
+  const query = isObjectId ? { _id: req.params.id } : { id: req.params.id }
+
+  const product = await BuildMartProduct.findOneAndUpdate(
+    query,
+    { 
+      status, 
+      rejectionReason: status === 'REJECTED' ? rejectionReason : '' 
+    },
+    { new: true, runValidators: true }
+  ).select('-__v').populate('vendorId', 'fullName phone email').lean()
+
+  if (!product) {
+    return sendError(res, { message: 'Product not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  }
+
+  return sendSuccess(res, {
+    message: `Product has been ${status.toLowerCase()}`,
+    data: product
+  })
+})
+
+// --- Banners ---
+
+export const getBanners = asyncHandler(async (req, res) => {
+  const banners = await BuildMartBanner.find()
+    .sort({ sortOrder: 1, createdAt: 1 })
+    .select('-_id -__v -createdAt -updatedAt')
+    .lean()
+  return sendSuccess(res, { data: banners })
+})
+
+export const getAdminBanners = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(500, Math.max(5, parseInt(req.query.limit, 10) || 50))
+  const [items, total] = await Promise.all([
+    BuildMartBanner.find()
+      .sort({ sortOrder: 1, createdAt: 1 })
+      .select('-_id -__v -createdAt -updatedAt')
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    BuildMartBanner.countDocuments(),
+  ])
+  return sendSuccess(res, {
+    data: { items, total, page, pages: Math.max(1, Math.ceil(total / limit)) },
+  })
+})
+
+export const createBanner = asyncHandler(async (req, res) => {
+  const banner = await BuildMartBanner.create(req.body)
+  const result = banner.toObject()
+  delete result._id
+  delete result.__v
+  delete result.createdAt
+  delete result.updatedAt
+  return sendSuccess(res, { data: result, statusCode: HTTP_STATUS.CREATED })
+})
+
+export const updateBanner = asyncHandler(async (req, res) => {
+  const banner = await BuildMartBanner.findOneAndUpdate({ id: req.params.id }, req.body, { new: true }).select('-_id -__v -createdAt -updatedAt').lean()
+  if (!banner) return sendError(res, { message: 'Banner not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { data: banner })
+})
+
+export const deleteBanner = asyncHandler(async (req, res) => {
+  const banner = await BuildMartBanner.findOneAndDelete({ id: req.params.id })
+  if (!banner) return sendError(res, { message: 'Banner not found', statusCode: HTTP_STATUS.NOT_FOUND })
+  return sendSuccess(res, { message: 'Banner deleted successfully' })
+})

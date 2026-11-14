@@ -1,0 +1,344 @@
+import { Link, useNavigate } from 'react-router-dom'
+import { motion, useReducedMotion, AnimatePresence } from 'framer-motion'
+import {
+  BarChart3,
+  ChevronRight,
+  ClipboardList,
+  Clock,
+  IndianRupee,
+  LifeBuoy,
+  MapPin,
+  Menu,
+  ShieldCheck,
+  Users,
+  Wallet,
+  ShoppingCart,
+} from 'lucide-react'
+import { ApprovalGate } from '../../components/shared/ApprovalGate.jsx'
+import { AppSectionHeader } from '../../components/app-ui/layout/AppSectionHeader.jsx'
+import { GlassPanel } from '../../components/ui/GlassPanel.jsx'
+import { VendorPageLayout } from '../../components/vendor/VendorPageLayout.jsx'
+import { isVendorPanelUnlocked } from '../../lib/vendorDemo.js'
+import { useEffect, useState } from 'react'
+import { vendorApi } from '../../api/vendorApi.js'
+import { filterVendorJobs } from '../../lib/vendorDummyData.js'
+import { formatVendorInr, openVendorDrawer, vendorInitials, vendorTimeGreeting } from '../../lib/vendorUiHelpers.js'
+
+const QUICK_ACTIONS = [
+  { to: '/vendor/jobs', label: 'Supply jobs', icon: ClipboardList, bg: 'from-sky-500/15 to-sky-50', tone: 'text-sky-700' },
+  { to: '/vendor/crew', label: 'Workforce', icon: Users, bg: 'from-violet-500/15 to-violet-50', tone: 'text-violet-700' },
+  { to: '/vendor/attendance', label: 'Attendance', icon: Clock, bg: 'from-amber-500/15 to-amber-50', tone: 'text-amber-800' },
+  { to: '/vendor/earnings', label: 'Payouts', icon: IndianRupee, bg: 'from-emerald-500/15 to-emerald-50', tone: 'text-emerald-700' },
+  { to: '/vendor/analytics', label: 'Insights', icon: BarChart3, bg: 'from-orange-500/15 to-orange-50', tone: 'text-orange-800' },
+  { to: '/vendor/support', label: 'Support', icon: LifeBuoy, bg: 'from-rose-500/15 to-rose-50', tone: 'text-rose-700' },
+]
+
+
+
+export function VendorHomeScreen({ user }) {
+  const reduce = useReducedMotion()
+  const navigate = useNavigate()
+  const unlocked = isVendorPanelUnlocked(user)
+  const verified = user?.contractorProfile?.verificationStatus === 'approved'
+  const [stats, setStats] = useState({})
+  const [activeSubscription, setActiveSubscription] = useState(null)
+  const [pendingJobs, setPendingJobs] = useState([])
+  const [banners, setBanners] = useState([])
+  const [bannerIdx, setBannerIdx] = useState(0)
+
+  useEffect(() => {
+    if (reduce || banners.length === 0) return undefined
+    const id = window.setInterval(() => {
+      setBannerIdx((i) => (i + 1) % banners.length)
+    }, 5000)
+    return () => window.clearInterval(id)
+  }, [reduce, banners])
+
+  useEffect(() => {
+    if (!verified || !unlocked) return
+
+    const loadDashboard = async () => {
+      try {
+        const statsRes = await vendorApi.getDashboardStats()
+        setStats(statsRes?.data?.stats || {})
+        setActiveSubscription(statsRes?.data?.activeSubscription || null)
+        
+        const jobsRes = await vendorApi.getJobs()
+        const allJobs = jobsRes?.data?.allocations || []
+        const pending = allJobs.filter(a => !a.vendorAcceptedAt && !a.vendorRejectedAt)
+        setPendingJobs(pending.slice(0, 2))
+
+        const bannersRes = await vendorApi.getBanners()
+        setBanners(bannersRes?.data?.banners || [])
+      } catch (err) {
+        console.error('Failed to load vendor dashboard', err)
+      }
+    }
+    loadDashboard()
+  }, [verified, unlocked])
+
+  const firstName = user?.fullName?.split(/\s/)?.[0]
+  const businessName = user?.contractorProfile?.businessName || user?.fullName || 'Vendor'
+  const initials = vendorInitials(user?.fullName || businessName)
+  const profileImageUrl = user?.profileImageUrl?.trim()
+
+  if (!unlocked) {
+    return (
+      <div className="px-4">
+        <ApprovalGate
+          title="Vendor verification required"
+          message="Upload business documents on your profile. Operations will verify your account before supply jobs unlock."
+          profileTo="/vendor/profile"
+        />
+      </div>
+    )
+  }
+
+  const hero = (
+    <section className="relative px-4 pb-2 mt-2">
+      <motion.div
+        initial={reduce ? false : { opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="relative overflow-hidden rounded-[1.75rem] border border-white/20 bg-linear-to-br from-slate-900 via-slate-800 to-slate-950 text-white shadow-[0_20px_50px_-24px_rgba(0,0,0,0.55)]"
+      >
+        <div
+          className="pointer-events-none absolute inset-0 bg-[url('https://images.unsplash.com/photo-1503387762-592deb58ef4e?w=800&q=60')] bg-cover bg-center opacity-25"
+          aria-hidden
+        />
+        <div className="pointer-events-none absolute inset-0 bg-linear-to-br from-slate-950/85 via-slate-900/75 to-brand/30" aria-hidden />
+
+        <div className="relative p-4 sm:p-5 pt-2 sm:pt-3 pb-4 sm:pb-5">
+          <div className="flex items-start justify-between gap-3">
+            <button
+              type="button"
+              onClick={openVendorDrawer}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/25 bg-white/10 backdrop-blur-sm hover:bg-white/20"
+              aria-label="Open menu"
+            >
+              <Menu className="h-5 w-5" />
+            </button>
+            <Link
+              to="/vendor/profile"
+              className="shrink-0 rounded-full p-0.5 ring-2 ring-white/35 hover:ring-white/60"
+              aria-label="Profile"
+            >
+              {profileImageUrl ? (
+                <img src={profileImageUrl} alt="" className="h-10 w-10 rounded-full object-cover" />
+              ) : (
+                <span className="flex h-10 w-10 items-center justify-center rounded-full bg-white/15 text-sm font-black">
+                  {initials}
+                </span>
+              )}
+            </Link>
+          </div>
+
+          <div className="mt-2 flex flex-row items-stretch gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-white/75">
+                {vendorTimeGreeting()}
+                {firstName ? `, ${firstName}` : ''} 👋
+              </p>
+              <h1 className="mt-0.5 line-clamp-2 text-base font-extrabold leading-tight sm:text-xl">{businessName}</h1>
+              <p className="mt-0.5 text-[10px] text-white/70">Contractor · workforce supply</p>
+              {verified ? (
+                <span className="mt-2 inline-flex max-w-full items-center gap-1 rounded-full border border-emerald-400/40 bg-emerald-500/20 px-2 py-0.5 text-[9px] font-bold uppercase text-emerald-100">
+                  <ShieldCheck className="h-2.5 w-2.5 shrink-0" aria-hidden />
+                  <span className="truncate">Verified vendor</span>
+                </span>
+              ) : (
+                <Link
+                  to="/vendor/profile"
+                  className="mt-2 inline-flex max-w-full items-center gap-0.5 rounded-full border border-amber-300/50 bg-amber-500/25 px-2 py-0.5 text-[9px] font-bold uppercase text-amber-50"
+                >
+                  <span className="truncate">Verify business</span>
+                  <ChevronRight className="h-2.5 w-2.5 shrink-0" aria-hidden />
+                </Link>
+              )}
+            </div>
+
+            <div className="flex w-[110px] shrink-0 flex-col sm:w-[130px]">
+              <div className="flex min-h-full min-w-0 flex-1 flex-col justify-between rounded-xl border border-emerald-400/35 bg-linear-to-br from-emerald-500/25 to-white/10 p-2.5 backdrop-blur-md">
+                <div>
+                  <p className="text-[8px] font-bold uppercase tracking-wider text-emerald-100/90">This month</p>
+                  <p className="mt-0.5 break-words font-mono text-sm font-black tabular-nums text-white sm:text-base">
+                    {formatVendorInr(stats.earningsMonth ?? 0)}
+                  </p>
+                </div>
+                <Link
+                  to="/vendor/earnings"
+                  className="mt-2 flex w-full items-center justify-center gap-1 rounded-lg bg-linear-to-r from-brand-bright to-brand py-1.5 text-[10px] font-black text-white shadow-md"
+                >
+                  <Wallet className="h-3 w-3 shrink-0" aria-hidden />
+                  Payouts
+                </Link>
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => navigate('/vendor/jobs')}
+            className="mt-4 flex w-full items-center gap-2 rounded-xl border border-white/20 bg-white/10 px-3 py-2.5 text-left text-sm backdrop-blur-sm hover:bg-white/15"
+          >
+            <MapPin className="h-4 w-4 shrink-0 text-brand-bright" aria-hidden />
+            <span className="min-w-0 flex-1 truncate font-medium text-white/90">
+              {stats.sitesActive ?? 0} active site deployments · tap to manage
+            </span>
+            <ChevronRight className="h-4 w-4 shrink-0 text-white/50" aria-hidden />
+          </button>
+        </div>
+      </motion.div>
+    </section>
+  )
+
+  return (
+    <motion.div initial={reduce ? false : { opacity: 0 }} animate={{ opacity: 1 }}>
+      <VendorPageLayout hero={hero} sheet>
+        <section>
+          <AppSectionHeader title="Quick actions" />
+          <div className="mt-3 grid grid-cols-3 gap-2.5">
+            {QUICK_ACTIONS.map(({ to, label, icon: Icon, bg, tone }) => (
+              <Link
+                key={to}
+                to={to}
+                className={`flex min-h-[5.5rem] flex-col items-center justify-center gap-2 rounded-2xl border border-slate-100 bg-linear-to-b ${bg} px-1.5 py-3 text-center shadow-sm ring-1 ring-slate-100/90 transition active:scale-[0.98] hover:shadow-md`}
+              >
+                <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white shadow-sm ${tone}`}>
+                  <Icon className="h-5 w-5" aria-hidden />
+                </span>
+                <span className="line-clamp-2 text-[10px] font-bold leading-tight text-slate-800">{label}</span>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        <GlassPanel className="grid grid-cols-3 gap-3 border-slate-200/90 p-4">
+          <div className="min-w-0 text-center">
+            <p className="text-[10px] font-bold uppercase text-slate-400">Crew</p>
+            <p className="mt-1 text-xl font-black tabular-nums text-slate-900">{stats.crewCount ?? 0}</p>
+          </div>
+          <div className="min-w-0 border-x border-slate-100 text-center">
+            <p className="text-[10px] font-bold uppercase text-slate-400">Present</p>
+            <p className="mt-1 text-xl font-black tabular-nums text-brand">{stats.presentToday ?? 0}</p>
+          </div>
+          <div className="min-w-0 text-center">
+            <p className="text-[10px] font-bold uppercase text-slate-400">Open jobs</p>
+            <p className="mt-1 text-xl font-black tabular-nums text-amber-700">{stats.openJobs ?? 0}</p>
+          </div>
+        </GlassPanel>
+
+        {pendingJobs.length > 0 ? (
+          <section>
+            <AppSectionHeader title="Accept allocations" actionLabel="View all" actionTo="/vendor/jobs" />
+            <ul className="mt-2 space-y-2">
+              {pendingJobs.map((a) => (
+                <li key={a._id}>
+                  <Link to={`/vendor/jobs/${a._id}`} className="block">
+                    <GlassPanel className="flex items-center justify-between gap-3 p-4 transition hover:border-brand/30">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-bold text-slate-900">{a.requestId?.reference}</p>
+                        <p className="truncate text-xs text-slate-500">{a.requestId?.clientName}</p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-amber-100 px-2.5 py-1 text-[10px] font-bold text-amber-900">
+                        Accept
+                      </span>
+                    </GlassPanel>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
+        <section className="mb-4">
+          {banners.length > 0 && (
+            <div className="relative aspect-[21/9] w-full overflow-hidden rounded-3xl mb-4 shadow-md bg-slate-100">
+              <AnimatePresence initial={false}>
+                <motion.div
+                  key={bannerIdx}
+                  initial={{ opacity: 0, x: 50 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -50 }}
+                  transition={{ duration: 0.4 }}
+                  className="absolute inset-0"
+                >
+                  {banners[bannerIdx]?.targetUrl ? (
+                    <a href={banners[bannerIdx].targetUrl} target="_blank" rel="noopener noreferrer" className="block h-full w-full">
+                      <img src={banners[bannerIdx].imageUrl} alt="Banner" className="h-full w-full object-cover" />
+                    </a>
+                  ) : (
+                    <img src={banners[bannerIdx]?.imageUrl} alt="Banner" className="h-full w-full object-cover" />
+                  )}
+                </motion.div>
+              </AnimatePresence>
+              <div className="absolute bottom-2.5 left-1/2 flex -translate-x-1/2 gap-1.5 z-10">
+                {banners.map((_, i) => (
+                  <div
+                    key={i}
+                    className={`h-1.5 rounded-full transition-all duration-300 shadow-sm ${i === bannerIdx ? 'w-4 bg-white' : 'w-1.5 bg-white/60'}`}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {activeSubscription ? (
+            <div className="flex flex-col gap-3 rounded-3xl border border-brand/20 bg-emerald-50/50 p-4 shadow-sm mb-4">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-brand/10">
+                  <ShoppingCart className="h-5 w-5 text-brand" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-base font-bold text-slate-900">{activeSubscription.plan?.name} Active</h3>
+                  <p className="text-xs font-medium text-slate-600">
+                    Valid till {new Date(activeSubscription.endDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 mt-2">
+                <Link to="/vendor/mart" className="flex-1 flex items-center justify-center gap-1.5 rounded-xl bg-brand py-2 text-xs font-bold text-white transition hover:opacity-90 shadow-sm">
+                  Go to App Mart
+                </Link>
+                <Link to="/vendor/mart/subscription" className="flex-1 flex items-center justify-center gap-1.5 rounded-xl border border-brand/30 bg-white/50 text-brand py-2 text-xs font-bold transition hover:bg-white shadow-sm">
+                  Upgrade Plan
+                </Link>
+              </div>
+            </div>
+          ) : (
+            <Link to="/vendor/mart/subscription" className="block">
+              <div className="flex items-center gap-4 rounded-3xl border border-white/10 bg-linear-to-r from-brand-bright to-brand p-4 shadow-lg shadow-brand/25 transition-all hover:-translate-y-0.5 hover:shadow-xl hover:shadow-brand/30">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white shadow-sm">
+                  <ShoppingCart className="h-5 w-5 text-brand" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-base font-bold text-white">App Mart</h3>
+                  <p className="truncate text-xs font-medium text-white/90">Buy materials, tools & safety gear</p>
+                </div>
+                <ChevronRight className="h-5 w-5 text-white opacity-70" />
+              </div>
+            </Link>
+          )}
+        </section>
+
+        <section>
+          <AppSectionHeader title="Supply workflow" />
+          <GlassPanel className="mt-2 space-y-3 border-slate-200/90 p-4">
+            {[
+              'Admin assigns bulk workforce request (FCFS)',
+              'You accept & deploy linked crew',
+              'Daily attendance tracked on site',
+              'Settlement after billing milestone',
+            ].map((step, i) => (
+              <div key={step} className="flex items-start gap-3">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-brand/10 text-xs font-black text-brand">
+                  {i + 1}
+                </span>
+                <p className="min-w-0 flex-1 pt-0.5 text-sm font-medium leading-snug text-slate-700">{step}</p>
+              </div>
+            ))}
+          </GlassPanel>
+        </section>
+      </VendorPageLayout>
+    </motion.div>
+  )
+}

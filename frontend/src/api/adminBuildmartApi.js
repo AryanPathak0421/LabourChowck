@@ -1,0 +1,145 @@
+import { apiRequest } from './http.js'
+
+export async function fetchAdminBuildMartLeads({ page = 1, limit = 20, status = 'all', search = '', type = 'all' } = {}) {
+  const params = new URLSearchParams()
+  params.set('page', String(page))
+  params.set('limit', String(limit))
+  if (status && status !== 'all') params.set('status', status)
+  if (type && type !== 'all') params.set('type', type)
+  if (search) params.set('search', search)
+
+  const data = await apiRequest(`/admin/buildmart/leads?${params}`)
+  return data?.data ?? data
+}
+
+export async function updateBuildMartLeadStatus(id, status) {
+  const data = await apiRequest(`/admin/buildmart/leads/${id}`, { method: 'PATCH', body: { status } })
+  return data?.data?.lead ?? data?.lead ?? data
+}
+
+export function buildWhatsAppLeadUrl(lead) {
+  const phone = import.meta.env.VITE_BUILDMART_ADMIN_WHATSAPP?.replace(/\D/g, '')
+  if (!phone) return null
+  const text = [
+    'BuildMart quote lead',
+    `Product: ${lead.productName}`,
+    lead.variantLabel ? `Variant: ${lead.variantLabel}` : null,
+    `Name: ${lead.name}`,
+    `Phone: ${lead.phone}`,
+    `Site: ${lead.siteLocation}`,
+    `Qty: ${lead.quantity}`,
+    lead.deliveryDate ? `Delivery: ${lead.deliveryDate}` : null,
+    lead.notes ? `Notes: ${lead.notes}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return `https://wa.me/${phone}?text=${encodeURIComponent(text)}`
+}
+
+export async function fetchAdminMartCategories({ page = 1, limit = 50 } = {}) {
+  const params = new URLSearchParams()
+  params.set('page', String(page))
+  params.set('limit', String(limit))
+  const data = await apiRequest(`/buildmart/admin/categories?${params}`);
+  return data;
+}
+export async function createAdminMartCategory(payload) {
+  const data = await apiRequest('/buildmart/admin/categories', { method: 'POST', body: payload });
+  return data;
+}
+export async function updateAdminMartCategory(id, payload) {
+  const data = await apiRequest('/buildmart/admin/categories/' + id, { method: 'PUT', body: payload });
+  return data;
+}
+export async function deleteAdminMartCategory(id) {
+  const data = await apiRequest('/buildmart/admin/categories/' + id, { method: 'DELETE' });
+  return data;
+}
+
+export async function fetchAdminMartProducts({ page = 1, limit = 50 } = {}) {
+  const params = new URLSearchParams()
+  params.set('page', String(page))
+  params.set('limit', String(limit))
+  const data = await apiRequest(`/buildmart/admin/products?${params}`);
+  return data;
+}
+export async function fetchAdminMartProductById(id) {
+  const data = await apiRequest('/buildmart/admin/products/' + id);
+  return data;
+}
+export async function createAdminMartProduct(payload) {
+  const data = await apiRequest('/buildmart/admin/products', { method: 'POST', body: payload });
+  return data;
+}
+export async function updateAdminMartProduct(id, payload) {
+  const data = await apiRequest('/buildmart/admin/products/' + id, { method: 'PUT', body: payload });
+  return data;
+}
+export async function patchAdminMartProduct(id, payload) {
+  const data = await apiRequest('/buildmart/admin/products/' + id, { method: 'PATCH', body: payload });
+  return data;
+}
+export async function deleteAdminMartProduct(id) {
+  const data = await apiRequest('/buildmart/admin/products/' + id, { method: 'DELETE' });
+  return data;
+}
+
+export async function fetchAdminMartBanners({ page = 1, limit = 50 } = {}) {
+  const params = new URLSearchParams()
+  params.set('page', String(page))
+  params.set('limit', String(limit))
+  const data = await apiRequest(`/buildmart/admin/banners?${params}`);
+  return data;
+}
+export async function createAdminMartBanner(payload) {
+  const data = await apiRequest('/buildmart/admin/banners', { method: 'POST', body: payload });
+  return data;
+}
+export async function updateAdminMartBanner(id, payload) {
+  const data = await apiRequest('/buildmart/admin/banners/' + id, { method: 'PUT', body: payload });
+  return data;
+}
+export async function deleteAdminMartBanner(id) {
+  const data = await apiRequest('/buildmart/admin/banners/' + id, { method: 'DELETE' });
+  return data;
+}
+export async function fetchAdminMartBannerById(id) {
+  const data = await apiRequest('/buildmart/admin/banners/' + id);
+  return data;
+}
+export async function patchAdminMartBanner(id, payload) {
+  const data = await apiRequest('/buildmart/admin/banners/' + id, { method: 'PATCH', body: payload });
+  return data;
+}
+
+export async function fetchAppMartCategories() {
+  const data = await apiRequest('/buildmart/app/categories');
+  return data;
+}
+export async function fetchAppMartProducts() {
+  const data = await apiRequest('/buildmart/app/products');
+  return data;
+}
+export async function fetchAppMartBanners() {
+  const data = await apiRequest('/buildmart/app/banners');
+  return data;
+}
+
+export async function getAdminBuildmartProducts(status = 'PENDING') {
+  const query = status ? `?status=${status}` : '';
+  const data = await apiRequest(`/buildmart/admin/products${query}`);
+  return data;
+}
+
+export async function getAdminBuildmartProductById(id) {
+  const data = await apiRequest(`/buildmart/admin/products/${id}`);
+  return data;
+}
+
+export async function reviewAdminBuildmartProduct(id, payload) {
+  const data = await apiRequest(`/buildmart/admin/products/${id}/review`, {
+    method: 'PATCH',
+    body: payload,
+  });
+  return data;
+}
