@@ -4,10 +4,27 @@ import { User } from './models/User.js'
 
 let io
 
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean)
+
 export const initSocket = (httpServer) => {
   io = new Server(httpServer, {
     cors: {
-      origin: process.env.CORS_ORIGIN?.split(',') || '*',
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true)
+        const cleanOrigin = origin.replace(/\/+$/, '')
+        if (
+          allowedOrigins.length === 0 ||
+          allowedOrigins.includes(cleanOrigin) ||
+          cleanOrigin.endsWith('.vercel.app') ||
+          cleanOrigin.includes('localhost')
+        ) {
+          return callback(null, true)
+        }
+        return callback(null, true)
+      },
       methods: ['GET', 'POST'],
       credentials: true,
     },
